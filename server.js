@@ -119,13 +119,22 @@ function extractIDNumber(text) {
 function extractName(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   
+  // Method 0: Look for any line containing Abu Taha (most reliable for our family)
+  const abuTahaRe = /أبو\s*طه|ابو\s*طه|أبوطه|ابوطه|أبو\s*طا|ابو\s*طا/i;
+  for (const line of lines) {
+    if (abuTahaRe.test(line)) {
+      const arWords = line.match(/[\u0600-\u06FF]+/g) || [];
+      if (arWords.length >= 2) return arWords.join(' ');
+    }
+  }
+
   // Method 1: Structured PA ID fields
   const fields = {};
   const patterns = [
-    {key:'first', re:/الاسم\s*الشخصي|الاسم\s*الفردي/i},
-    {key:'father', re:/اسم\s*الأب|اسم\s*الاب/i},
-    {key:'grand', re:/اسم\s*الجد/i},
-    {key:'family', re:/اسم\s*العائلة|اسم\s*المشپحة/i},
+    {key:'first', re:/الاسم\s*الشخصي|الاسم\s*الفردي|الاسم\s*الأول|الاسم/i},
+    {key:'father', re:/اسم\s*الأب|اسم\s*الاب|الأب/i},
+    {key:'grand', re:/اسم\s*الجد|الجد/i},
+    {key:'family', re:/اسم\s*العائلة|العائلة|اللقب/i},
   ];
   lines.forEach(line => {
     patterns.forEach(({key, re}) => {
@@ -141,7 +150,7 @@ function extractName(text) {
     if (parts.length >= 2) return parts.join(' ');
   }
 
-  // Method 2: Abu Taha in line
+  // Method 2: Abu Taha in line  
   const abt = /اب[وu][\s-]*ط[هh]|ابوطه|أبوطه/i;
   for (const line of lines) {
     if (abt.test(line) && /[\u0600-\u06FF]/.test(line)) {
@@ -246,6 +255,20 @@ function buildResult(text, name, id, service, conf) {
   const sim = calcSimilarity(name, parsed.name);
   const idMatch = !!parsed.idNumber && parsed.idNumber === id;
   const status = getStatus(sim, idMatch);
+  
+  let message;
+  if (status === 'verified') {
+    message = `✅ تم التحقق — تطابق ${sim}%`;
+  } else if (idMatch && sim >= 50) {
+    message = `⚠️ رقم الهوية مطابق وتطابق الاسم ${sim}% — ستُراجع`;
+  } else if (idMatch) {
+    message = `⚠️ رقم الهوية مطابق لكن الاسم مختلف — ستُراجع`;
+  } else if (sim >= 70) {
+    message = `⚠️ الاسم متطابق ${sim}% لكن رقم الهوية مختلف — ستُراجع`;
+  } else {
+    message = `⚠️ تطابق ${sim}% — ستُراجع يدوياً من اللجنة`;
+  }
+  
   return {
     status,
     extracted_name: parsed.name,
@@ -256,9 +279,8 @@ function buildResult(text, name, id, service, conf) {
     name_similarity: sim,
     ocr_service: service,
     ocr_confidence: conf,
-    message: status==='verified'
-      ? `✅ تم التحقق — تطابق ${sim}%`
-      : `⚠️ تطابق ${sim}% — ستُراجع يدوياً من اللجنة`,
+    raw_text: text.substring(0, 500), // First 500 chars for debug
+    message,
   };
 }
 
