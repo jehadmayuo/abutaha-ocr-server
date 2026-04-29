@@ -265,11 +265,14 @@ function getStatus(sim, idMatch) {
   return 'needs_review'; // Never auto-reject
 }
 
-function buildResult(text, name, id, service, conf) {
+function buildResult(text, name, id, service, conf, providedDocType) {
   const parsed = parseID(text);
   const sim = calcSimilarity(name, parsed.name);
+  // For non-PA documents, ID match isn't required
+  const isPaId = (providedDocType === 'pa_id') || (parsed.docType === 'pa_id');
   const idMatch = !!parsed.idNumber && parsed.idNumber === id;
-  const status = getStatus(sim, idMatch);
+  // For non-PA docs: only check name similarity
+  const status = isPaId ? getStatus(sim, idMatch) : (sim >= 70 ? 'verified' : (sim >= 40 ? 'needs_review' : 'needs_review'));
   
   let message;
   if (status === 'verified') {
@@ -288,7 +291,7 @@ function buildResult(text, name, id, service, conf) {
     status,
     extracted_name: parsed.name,
     extracted_id: parsed.idNumber,
-    doc_type: parsed.docType,
+    doc_type: providedDocType || parsed.docType,
     confidence: sim,
     id_matched: idMatch,
     name_similarity: sim,
@@ -316,10 +319,17 @@ app.post('/api/verify-id', upload.single('image'), async (req, res) => {
   try {
     const name = (req.body.entered_name||'').trim();
     const id = (req.body.entered_id||'').replace(/\s/g,'').trim();
+    const docType = (req.body.doc_type||'other').trim();
 
-    if (!req.file) return res.status(400).json({ status:'error', message:'يجب رفع صورة الهوية', extracted_name:'', extracted_id:'', confidence:0 });
+    if (!req.file) return res.status(400).json({ status:'error', message:'يجب رفع صورة الوثيقة', extracted_name:'', extracted_id:'', confidence:0 });
+    
+    // For non-PA-ID documents, name is enough (no 9-digit check)
     if (!name) return res.status(400).json({ status:'error', message:'الاسم مطلوب', extracted_name:'', extracted_id:'', confidence:0 });
-    if (!/^\d{9}$/.test(id)) return res.status(400).json({ status:'error', message:'رقم الهوية يجب أن يكون 9 أرقام', extracted_name:'', extracted_id:'', confidence:0 });
+    
+    // Only require 9-digit ID for PA ID type
+    if (docType === 'pa_id' && !/^\d{9}$/.test(id)) {
+      return res.status(400).json({ status:'error', message:'رقم الهوية الفلسطينية يجب أن يكون 9 أرقام', extracted_name:'', extracted_id:'', confidence:0 });
+    }
 
     const {buffer, mimetype} = req.file;
     console.log(`[OCR] "${name}" | ID:${id} | ${buffer.length}b`);
@@ -329,7 +339,7 @@ app.post('/api/verify-id', upload.single('image'), async (req, res) => {
     console.log(`[OCR.space] ok:${r1.ok} conf:${r1.conf} len:${r1.text.length}`);
 
     if (r1.ok && r1.text.length >= 5) {
-      const result = buildResult(r1.text, name, id, 'ocr.space', r1.conf);
+      const result = buildResult(r1.text, name, id, 'ocr.space', r1.conf, docType);
       if (result.name_similarity > 0 || result.id_matched) {
         console.log(`[OCR.space] ${result.status} ${result.name_similarity}% ${Date.now()-t}ms`);
         return res.json({...result, ms: Date.now()-t});
@@ -342,7 +352,7 @@ app.post('/api/verify-id', upload.single('image'), async (req, res) => {
     console.log(`[Google] ok:${r2.ok} conf:${r2.conf} len:${r2.text.length}`);
 
     if (r2.ok && r2.text.length >= 5) {
-      const result = buildResult(r2.text, name, id, 'google_vision', r2.conf);
+      const result = buildResult(r2.text, name, id, 'google_vision', r2.conf, docType);
       console.log(`[Google] ${result.status} ${result.name_similarity}% ${Date.now()-t}ms`);
       return res.json({...result, ms: Date.now()-t});
     }
