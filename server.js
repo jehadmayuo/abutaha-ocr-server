@@ -193,7 +193,7 @@ function parseID(text) {
 // ══════════════════════════════════════════════════════
 // OCR.SPACE SERVICE (Primary — 25,000/month free)
 // ══════════════════════════════════════════════════════
-async function ocrSpace(buffer, mime) {
+async function ocrSpaceTry(buffer, mime, engine) {
   try {
     const form = new FormData();
     form.append('file', buffer, { filename:'id.jpg', contentType: mime });
@@ -201,21 +201,36 @@ async function ocrSpace(buffer, mime) {
     form.append('language', 'ara');
     form.append('detectOrientation', 'true');
     form.append('scale', 'true');
-    form.append('OCREngine', '2');
+    form.append('isTable', 'true');
+    form.append('OCREngine', String(engine));
 
     const res = await axios.post('https://api.ocr.space/parse/image', form, {
-      headers: form.getHeaders(), timeout: 20000,
+      headers: form.getHeaders(), timeout: 25000, maxBodyLength: 15*1024*1024,
     });
     const data = res.data;
-    if (data.IsErroredOnProcessing) return { ok:false, text:'', conf:0, err: data.ErrorMessage?.[0] };
+    if (data.IsErroredOnProcessing) return { ok:false, text:'', conf:0, err: (data.ErrorMessage&&data.ErrorMessage[0])||'OCR error' };
     const results = data.ParsedResults || [];
     const text = results.map(r => r.ParsedText||'').join('\n').trim();
     if (!text) return { ok:false, text:'', conf:0, err:'No text found' };
-    const conf = results.reduce((s,r) => s + (parseFloat(r.TextOverlay?.MeanConfidence)||50), 0) / results.length;
+    const conf = results.length ? (results.reduce((s,r) => s + (parseFloat(r.TextOverlay?.MeanConfidence)||50), 0) / results.length) : 50;
     return { ok:true, text, conf: Math.round(conf), err:null };
   } catch(e) {
     return { ok:false, text:'', conf:0, err: e.message };
   }
+}
+
+async function ocrSpace(buffer, mime) {
+  // Try Engine 2 first (best for Arabic)
+  let res = await ocrSpaceTry(buffer, mime, 2);
+  if (res.ok && res.text.length > 15) return res;
+  
+  // Fallback to Engine 1
+  console.log('[OCR.space] Engine 2 failed, trying Engine 1...');
+  const res1 = await ocrSpaceTry(buffer, mime, 1);
+  if (res1.ok && res1.text.length > 15) return res1;
+  
+  // Return whichever had more text
+  return (res.text.length > res1.text.length) ? res : res1;
 }
 
 // ══════════════════════════════════════════════════════
@@ -313,7 +328,7 @@ app.post('/api/verify-id', upload.single('image'), async (req, res) => {
     const r1 = await ocrSpace(buffer, mimetype);
     console.log(`[OCR.space] ok:${r1.ok} conf:${r1.conf} len:${r1.text.length}`);
 
-    if (r1.ok && r1.text.length >= 15 && r1.conf >= 25) {
+    if (r1.ok && r1.text.length >= 5) {
       const result = buildResult(r1.text, name, id, 'ocr.space', r1.conf);
       if (result.name_similarity > 0 || result.id_matched) {
         console.log(`[OCR.space] ${result.status} ${result.name_similarity}% ${Date.now()-t}ms`);
@@ -326,7 +341,7 @@ app.post('/api/verify-id', upload.single('image'), async (req, res) => {
     const r2 = await googleVision(buffer);
     console.log(`[Google] ok:${r2.ok} conf:${r2.conf} len:${r2.text.length}`);
 
-    if (r2.ok && r2.text.length >= 15) {
+    if (r2.ok && r2.text.length >= 5) {
       const result = buildResult(r2.text, name, id, 'google_vision', r2.conf);
       console.log(`[Google] ${result.status} ${result.name_similarity}% ${Date.now()-t}ms`);
       return res.json({...result, ms: Date.now()-t});
