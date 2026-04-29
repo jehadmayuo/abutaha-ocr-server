@@ -193,6 +193,96 @@ function parseID(text) {
 // ══════════════════════════════════════════════════════
 // OCR.SPACE SERVICE (Primary — 25,000/month free)
 // ══════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════
+// GROQ VISION (PRIMARY — Free 14,400/day, excellent Arabic)
+// ══════════════════════════════════════════════════════
+async function groqVision(buffer, mime, docType) {
+  const GROQ_KEY = process.env.GROQ_API_KEY || '';
+  if (!GROQ_KEY) return { ok:false, text:'', conf:0, err:'GROQ_API_KEY not set' };
+
+  try {
+    const b64 = buffer.toString('base64');
+    const dataUrl = `data:${mime||'image/jpeg'};base64,${b64}`;
+
+    const docTypeArabic = {
+      pa_id: 'هوية وطنية فلسطينية',
+      passport: 'جواز سفر',
+      driving_license: 'رخصة قيادة',
+      birth_certificate: 'شهادة ميلاد',
+      temp_id: 'بطاقة تعريف مؤقتة',
+      other: 'وثيقة',
+    };
+    const docName = docTypeArabic[docType] || 'وثيقة';
+
+    const prompt = `هذه صورة ${docName} باللغة العربية. استخرج البيانات التالية بدقة:
+1. الاسم الكامل (الاسم الشخصي + اسم الأب + اسم الجد + اسم العائلة)
+2. رقم الهوية (9 أرقام إن وُجد)
+3. تاريخ الميلاد (DD/MM/YYYY)
+4. تاريخ الإصدار (إن وُجد)
+
+أعد الإجابة بصيغة JSON فقط بدون أي شرح:
+{"name":"الاسم الكامل","id":"123456789","dob":"DD/MM/YYYY","issue_date":"DD/MM/YYYY","confidence":"high|medium|low"}`;
+
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'llama-3.2-90b-vision-preview',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: dataUrl } }
+          ]
+        }],
+        temperature: 0.1,
+        max_tokens: 500,
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${GROQ_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    const content = response.data?.choices?.[0]?.message?.content || '';
+    console.log('[Groq] Raw response:', content.substring(0, 300));
+
+    // Parse JSON from response
+    let extracted = {};
+    try {
+      const cleaned = content.replace(/```json|```/g, '').trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (jsonMatch) extracted = JSON.parse(jsonMatch[0]);
+    } catch(e) {
+      console.error('[Groq] Parse error:', e.message);
+    }
+
+    // Build text representation for compatibility with parser
+    const textRepr = [
+      extracted.name ? `الاسم: ${extracted.name}` : '',
+      extracted.id ? `رقم الهوية: ${extracted.id}` : '',
+      extracted.dob ? `تاريخ الميلاد: ${extracted.dob}` : '',
+      extracted.issue_date ? `تاريخ الإصدار: ${extracted.issue_date}` : '',
+    ].filter(Boolean).join('\n');
+
+    if (!textRepr) {
+      return { ok:false, text:content, conf:0, err:'Could not parse JSON response' };
+    }
+
+    const conf = extracted.confidence === 'high' ? 90 : (extracted.confidence === 'medium' ? 70 : 50);
+    return { ok:true, text:textRepr, conf, extracted, err:null };
+
+  } catch(err) {
+    const errMsg = err.response?.data?.error?.message || err.message || 'Groq error';
+    console.error('[Groq] Error:', errMsg);
+    return { ok:false, text:'', conf:0, err:errMsg };
+  }
+}
+
+
 async function ocrSpaceTry(buffer, mime, engine) {
   try {
     const form = new FormData();
@@ -309,8 +399,11 @@ app.get('/', (req, res) => res.json({ status:'ok', name:'Abu Taha OCR Server', v
 
 app.get('/api/health', (req, res) => res.json({
   status:'ok',
+  groq_vision: !!process.env.GROQ_API_KEY,
   ocr_space: !!OCR_SPACE_KEY,
   google_vision: !!GOOGLE_VISION_KEY,
+  primary: 'groq_vision',
+  fallback: ['ocr.space', 'google_vision'],
   thresholds: { verified:'>=70%+ID', needs_review:'50-69%', never_auto_reject:true },
 }));
 
@@ -334,7 +427,47 @@ app.post('/api/verify-id', upload.single('image'), async (req, res) => {
     const {buffer, mimetype} = req.file;
     console.log(`[OCR] "${name}" | ID:${id} | ${buffer.length}b`);
 
-    // Try OCR.space first
+    // Try Groq Vision FIRST (best Arabic accuracy)
+    console.log('[OCR] Trying Groq Vision...');
+    const rGroq = await groqVision(buffer, mimetype, docType);
+    console.log(`[Groq] ok:${rGroq.ok} conf:${rGroq.conf} extracted:`, rGroq.extracted || {});
+
+    if (rGroq.ok && rGroq.extracted && rGroq.extracted.name) {
+      // Use the extracted data directly
+      const ext = rGroq.extracted;
+      const sim = calcSimilarity(name, ext.name || '');
+      const idMatch = !!(ext.id && ext.id === id);
+      const isPaId = (docType === 'pa_id');
+      const status = isPaId
+        ? (sim >= 70 && idMatch ? 'verified' : (sim >= 50 ? 'needs_review' : 'needs_review'))
+        : (sim >= 70 ? 'verified' : 'needs_review');
+      
+      let message;
+      if (status === 'verified') message = `✅ تم التحقق — تطابق ${sim}%`;
+      else if (idMatch) message = `⚠️ رقم الهوية مطابق — الاسم ${sim}% — ستُراجع`;
+      else if (sim >= 70) message = `⚠️ الاسم متطابق ${sim}% — رقم الهوية مختلف — ستُراجع`;
+      else message = `⚠️ تطابق ${sim}% — ستُراجع يدوياً من اللجنة`;
+
+      console.log(`[Groq] ${status} ${sim}% ${Date.now()-t}ms`);
+      return res.json({
+        status,
+        extracted_name: ext.name || '',
+        extracted_id: ext.id || '',
+        extracted_dob: ext.dob || '',
+        extracted_issue_date: ext.issue_date || '',
+        doc_type: docType,
+        confidence: sim,
+        id_matched: idMatch,
+        name_similarity: sim,
+        ocr_service: 'groq_vision',
+        ocr_confidence: rGroq.conf,
+        message,
+        ms: Date.now() - t,
+      });
+    }
+
+    // Fallback 1: OCR.space
+    console.log('[OCR] Groq failed, trying OCR.space...');
     const r1 = await ocrSpace(buffer, mimetype);
     console.log(`[OCR.space] ok:${r1.ok} conf:${r1.conf} len:${r1.text.length}`);
 
@@ -346,7 +479,7 @@ app.post('/api/verify-id', upload.single('image'), async (req, res) => {
       }
     }
 
-    // Fallback to Google Vision
+    // Fallback 2: Google Vision
     console.log('[OCR] Trying Google Vision...');
     const r2 = await googleVision(buffer);
     console.log(`[Google] ok:${r2.ok} conf:${r2.conf} len:${r2.text.length}`);
